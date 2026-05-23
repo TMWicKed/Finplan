@@ -1,0 +1,157 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: finplan-postgres
+    environment:
+      POSTGRES_DB: finplan_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_secure_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d finplan_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: finplan-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: finplan-auth-service
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - JWT_SECRET=finplan_jwt_secret_key_2026
+      - DATABASE_URL=postgresql://postgres:postgres_secure_pass@postgres:5432/finplan_db
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  client-profile-service:
+    build:
+      context: ./services/client-profile-service
+      dockerfile: Dockerfile
+    container_name: finplan-client-profile-service
+    environment:
+      - PORT=3002
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+      - DATABASE_URL=postgresql://postgres:postgres_secure_pass@postgres:5432/finplan_db
+    ports:
+      - "3002:3002"
+    depends_on:
+      - auth-service
+
+  goal-planning-service:
+    build:
+      context: ./services/goal-planning-service
+      dockerfile: Dockerfile
+    container_name: finplan-goal-planning-service
+    environment:
+      - PORT=3003
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+      - DATABASE_URL=postgresql://postgres:postgres_secure_pass@postgres:5432/finplan_db
+    ports:
+      - "3003:3003"
+    depends_on:
+      - auth-service
+
+  savings-intelligence-service:
+    build:
+      context: ./services/savings-intelligence-service
+      dockerfile: Dockerfile
+    container_name: finplan-savings-intelligence-service
+    environment:
+      - PORT=3004
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+    ports:
+      - "3004:3004"
+    depends_on:
+      - auth-service
+
+  investment-service:
+    build:
+      context: ./services/investment-service
+      dockerfile: Dockerfile
+    container_name: finplan-investment-service
+    environment:
+      - PORT=3005
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+      - DATABASE_URL=postgresql://postgres:postgres_secure_pass@postgres:5432/finplan_db
+    ports:
+      - "3005:3005"
+    depends_on:
+      - auth-service
+
+  whatif-engine-service:
+    build:
+      context: ./services/whatif-engine-service
+      dockerfile: Dockerfile
+    container_name: finplan-whatif-engine-service
+    environment:
+      - PORT=3006
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+    ports:
+      - "3006:3006"
+    depends_on:
+      - auth-service
+
+  ira-agent-service:
+    build:
+      context: ./services/ira-agent-service
+      dockerfile: Dockerfile
+    container_name: finplan-ira-agent-service
+    environment:
+      - PORT=3007
+      - NODE_ENV=production
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - AUTH_SERVICE_URL=http://auth-service:3001
+    ports:
+      - "3007:3007"
+    depends_on:
+      - auth-service
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: finplan-notification-service
+    environment:
+      - PORT=3008
+      - NODE_ENV=production
+      - AUTH_SERVICE_URL=http://auth-service:3001
+    ports:
+      - "3008:3008"
+    depends_on:
+      - auth-service
+
+volumes:
+  postgres_data:
+  redis_data:

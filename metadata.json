@@ -1,0 +1,6 @@
+{
+  "name": "FinPlan GPS",
+  "description": "An AI-powered personal financial planning platform featuring Goal GPS, Savings Intelligence, Investment Planner, What-If Engine, and Ira conversational agent.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
