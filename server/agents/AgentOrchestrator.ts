@@ -7,6 +7,7 @@ import crypto from "crypto";
 import { AgentRegistry } from "./AgentRegistry.js";
 import { ConfidenceEvaluationService } from "./ConfidenceEvaluationService.js";
 import { storeExecutionTrace } from "./executionTraceStore.js";
+import { MarketIntelligenceAgent } from "./MarketIntelligenceAgent.js";
 import { GoalPlanningAgent } from "./GoalPlanningAgent.js";
 import { WhatIfSimulationAgent } from "./WhatIfSimulationAgent.js";
 import { BehavioralFinanceAgent } from "./BehavioralFinanceAgent.js";
@@ -27,6 +28,7 @@ import type { ClientProfile, FinancialGoal } from "../../src/types.js";
 import type { PlaybookRecord } from "../lib/playbooks.js";
 
 const PIPELINE_ORDER = [
+  "MarketIntelligenceAgent",
   "GoalPlanningAgent",
   "WhatIfSimulationAgent",
   "BehavioralFinanceAgent",
@@ -48,6 +50,7 @@ export class AgentOrchestrator {
   constructor() {
     this.registry = new AgentRegistry();
     this.confidenceService = new ConfidenceEvaluationService();
+    this.registry.register(new MarketIntelligenceAgent());
     this.registry.register(new GoalPlanningAgent());
     this.registry.register(new WhatIfSimulationAgent());
     this.registry.register(new BehavioralFinanceAgent());

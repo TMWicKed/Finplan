@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1779548103803,
+      "tag": "0000_reflection_agent_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1779549038265,
+      "tag": "0001_add_confidence_evaluation_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1779549390328,
+      "tag": "0002_agent_human_feedback",
+      "breakpoints": true
+    }
+  ]
+}

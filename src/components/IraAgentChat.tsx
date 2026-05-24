@@ -110,6 +110,7 @@ interface IraAgentChatProps {
 }
 
 const AGENT_DISPLAY: Record<string, { title: string; desc: string }> = {
+  MarketIntelligenceAgent: { title: "Market Intelligence", desc: "Loading major bank FD and savings rate matrix..." },
   GoalPlanningAgent: { title: "Goal Planning Agent", desc: "Analyzing goals, SIP needs, and funding gaps..." },
   WhatIfSimulationAgent: { title: "What-If Agent", desc: "Running home-loan EMI and surplus impact simulation..." },
   BehavioralFinanceAgent: { title: "Behavior Agent", desc: "Detecting panic, FOMO, and concentration bias..." },
@@ -119,6 +120,7 @@ const AGENT_DISPLAY: Record<string, { title: string; desc: string }> = {
 };
 
 const PIPELINE_ORDER = [
+  "MarketIntelligenceAgent",
   "GoalPlanningAgent",
   "WhatIfSimulationAgent",
   "BehavioralFinanceAgent",

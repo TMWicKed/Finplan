@@ -60,6 +60,13 @@ export interface GovernanceSummary {
   mostCommonRiskCategories: LearningInsightItem[];
 }
 
+export interface ImprovementRecommendationItem {
+  issue: string;
+  recommendation: string;
+  frequency: number;
+  source: "reflection" | "feedback" | "confidence";
+}
+
 export interface LearningDashboardPayload {
   agentPerformance: AgentPerformanceMetric[];
   reflectionStatistics: ReflectionStatistics;
@@ -67,7 +74,12 @@ export interface LearningDashboardPayload {
   feedbackTrends: FeedbackTrendPoint[];
   learningInsights: LearningInsights;
   governance: GovernanceSummary;
+  improvementRecommendations: ImprovementRecommendationItem[];
   promptCorrectionsActive: number;
   totalExecutions: number;
+  persistence: {
+    postgresConfigured: boolean;
+    fallbackMode: boolean;
+  };
   generatedAt: string;
 }

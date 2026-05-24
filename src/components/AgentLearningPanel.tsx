@@ -57,6 +57,13 @@ export interface LearningDashboardData {
     mostCommonReviewTriggers: Array<{ label: string; count: number }>;
     mostCommonRiskCategories: Array<{ label: string; count: number }>;
   };
+  improvementRecommendations?: Array<{
+    issue: string;
+    recommendation: string;
+    frequency: number;
+    source: string;
+  }>;
+  persistence?: { postgresConfigured: boolean; fallbackMode: boolean };
   promptCorrectionsActive: number;
   totalExecutions: number;
   generatedAt: string;
@@ -69,6 +76,7 @@ interface AgentLearningPanelProps {
 }
 
 const AGENT_LABELS: Record<string, string> = {
+  MarketIntelligenceAgent: "Market Intel",
   GoalPlanningAgent: "Goal Planning",
   WhatIfSimulationAgent: "What-If",
   BehavioralFinanceAgent: "Behavioral",
@@ -322,12 +330,23 @@ export default function AgentLearningPanel({ data, loading, onRefresh }: AgentLe
                 {opp}
               </li>
             ))}
+            {(data.improvementRecommendations ?? []).map((rec) => (
+              <li key={rec.issue} className="text-[10px] text-slate-600 leading-snug flex gap-1">
+                <span className="text-amber-500">★</span>
+                <span>
+                  <strong>{rec.issue}</strong> ({rec.frequency}×): {rec.recommendation}
+                </span>
+              </li>
+            ))}
           </ul>
         </div>
       </div>
 
       <p className="text-[8px] text-slate-400 font-mono text-center">
-        Continuous improvement loop · Generate → Reflect → Feedback → Learn
+        {data.persistence?.postgresConfigured
+          ? "PostgreSQL persistence enabled"
+          : "In-memory fallback (set DATABASE_URL for Postgres)"}
+        {" · "}Generate → Reflect → Feedback → Learn
       </p>
     </div>
   );

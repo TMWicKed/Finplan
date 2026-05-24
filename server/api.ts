@@ -5,6 +5,10 @@
 
 import { Router, Request, Response, NextFunction } from "express";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { authenticateDemoUser } from "./lib/demoAuth.js";
 import {
   User,
   RAHUL_SHARMA_PROFILE,
@@ -19,8 +23,15 @@ import { runGoalSipSimulation } from "./lib/goalPlanning.js";
 import { runWhatIfHomePurchaseSimulation } from "./lib/whatIfSimulation.js";
 import { cleanAndRepairJSON, getGeminiClient } from "./lib/geminiSupport.js";
 import { getAgentOrchestrator, getExecutionTrace, getLearningDashboardService } from "./agents/index.js";
+import { isDatabaseConfigured } from "./db/client.js";
+import { persistHumanFeedbackToDatabase } from "./db/tracePersistence.js";
 
 const apiRouter = Router();
+const serverStartedAt = Date.now();
+const APP_VERSION = "1.0.0";
+
+const __apiDir = path.dirname(fileURLToPath(import.meta.url));
+const OPENAPI_YAML_PATH = path.resolve(__apiDir, "../docs/openapi.yaml");
 
 interface BehavioralAlert {
   id: string;
@@ -291,6 +302,18 @@ function sendResponse(
   });
 }
 
+/** Guidelines §2.4 — business / semantic validation failures */
+function sendValidationError(
+  res: Response,
+  message: string,
+  fieldErrors: Array<{ field: string; message: string } | string> = []
+) {
+  const errors = fieldErrors.map((e) =>
+    typeof e === "string" ? { field: "_", message: e } : e
+  );
+  return sendResponse(res, 422, false, message, null, errors);
+}
+
 // --- JWT-LIKE IMMUTABLE ENCRYPTION SIGNATURES ---
 // A secure, lightweight signature mechanism utilizing Node.js native crypto to eliminate unstable native dependency build failures
 const JWT_SECRET = process.env.JWT_SECRET || "finplan_gps_secret_2026_walkingtree";
@@ -346,15 +369,42 @@ export function authMiddleware(requiredRoles?: string[]) {
 }
 
 // --- MICROSERVICES HEALTH & BASIC SPECS ---
-apiRouter.get("/health", (req: Request, res: Response) => {
-  res.status(200).json({ status: "UP", service: "gateway-service", timestamp: new Date().toISOString() });
+apiRouter.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({
+    service: "finplan-gps-api",
+    status: "UP",
+    version: APP_VERSION,
+    timestamp: new Date().toISOString()
+  });
+});
+
+apiRouter.get("/api/v1/system/health", (_req: Request, res: Response) => {
+  const postgresConfigured = isDatabaseConfigured();
+  res.status(200).json({
+    status: "UP",
+    postgres: postgresConfigured ? "connected_configured" : "not_configured",
+    fallbackMode: !postgresConfigured,
+    gemini: Boolean(process.env.GEMINI_API_KEY?.trim()),
+    uptimeSeconds: Math.floor((Date.now() - serverStartedAt) / 1000),
+    timestamp: new Date().toISOString()
+  });
+});
+
+apiRouter.get("/api/v1/openapi.yaml", (_req: Request, res: Response) => {
+  try {
+    const spec = fs.readFileSync(OPENAPI_YAML_PATH, "utf8");
+    res.type("application/yaml").send(spec);
+  } catch {
+    sendResponse(res, 404, false, "OpenAPI specification file not found");
+  }
 });
 
 apiRouter.get("/api/v1/service-info", (req: Request, res: Response) => {
   res.status(200).json({
     appName: "FinPlan GPS API",
-    version: "v1.0.0",
+    version: APP_VERSION,
     hackathon: "WalkingTree Hackathon 2026",
+    openApiSpecUrl: "/api/v1/openapi.yaml",
     activeServices: [
       "auth-service (Port 3001)",
       "client-profile-service (Port 3002)",
@@ -373,33 +423,29 @@ apiRouter.post("/api/v1/auth/login", (req: Request, res: Response) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    sendResponse(res, 400, false, "Bad Request: Email and password are required", {}, ["Missing credentials"]);
+    sendValidationError(res, "Validation failed", [
+      ...(!email ? [{ field: "email", message: "Email is required" }] : []),
+      ...(!password ? [{ field: "password", message: "Password is required" }] : [])
+    ]);
     return;
   }
 
-  // Demo accounts
-  let role = "";
-  let name = "";
-  if (email === "planner@finplan.in" && password === "planner123") {
-    role = "PLANNER";
-    name = "Amit Mehta (Senior Planner)";
-  } else if (email === "rahul@gmail.com" && password === "rahul123") {
-    role = "CLIENT";
-    name = "Rahul Sharma";
-  } else {
+  const account = authenticateDemoUser(email, password);
+  if (!account) {
     addAuditLog("Login attempt failed", "auth-service", email, "FAILED");
     sendResponse(res, 401, false, "Invalid email or password", {}, ["Incorrect login details"]);
     return;
   }
 
-  const token = createToken({ id: `user_${role.toLowerCase()}`, email, role });
+  const { role, name, email: accountEmail } = account;
+  const token = createToken({ id: `user_${role.toLowerCase()}`, email: accountEmail, role });
   addAuditLog(`User login successful`, "auth-service", name, "SUCCESS");
 
   sendResponse(res, 200, true, "Login successful", {
     user: {
       id: `user_${role.toLowerCase()}`,
       name,
-      email,
+      email: accountEmail,
       role,
       token
     }
@@ -469,7 +515,11 @@ apiRouter.post("/api/v1/goals/simulate", authMiddleware(), (req: Request, res: R
   const { monthlySIP, annualRate, years } = req.body;
 
   if (monthlySIP === undefined || annualRate === undefined || years === undefined) {
-    sendResponse(res, 400, false, "Parameters are missing or invalid", {}, ["Need monthlySIP, annualRate, and years"]);
+    sendValidationError(res, "Validation failed", [
+      { field: "monthlySIP", message: "monthlySIP is required" },
+      { field: "annualRate", message: "annualRate is required" },
+      { field: "years", message: "years is required" }
+    ]);
     return;
   }
 
@@ -682,7 +732,7 @@ apiRouter.post("/api/v1/ira/chat", authMiddleware(), async (req: Request, res: R
   const { message, chatHistory, whatIfState } = req.body;
 
   if (!message) {
-    sendResponse(res, 400, false, "Prompt message is empty", {}, ["Missing prompt"]);
+    sendValidationError(res, "Validation failed", [{ field: "message", message: "Prompt message is required" }]);
     return;
   }
 
@@ -790,7 +840,7 @@ apiRouter.post("/api/v1/ira/chat", authMiddleware(), async (req: Request, res: R
 apiRouter.post("/api/v1/ira/agent-workflow", authMiddleware(), async (req: Request, res: Response) => {
   const { message, chatHistory, whatIfState } = req.body;
   if (!message) {
-    sendResponse(res, 400, false, "Prompt message is required", {}, ["Missing message"]);
+    sendValidationError(res, "Validation failed", [{ field: "message", message: "Prompt message is required" }]);
     return;
   }
 
@@ -1125,7 +1175,10 @@ apiRouter.post("/api/v1/ira/feedback", authMiddleware(), (req: Request, res: Res
   } = req.body;
 
   if (!userQuery || !iraResponse) {
-    sendResponse(res, 400, false, "userQuery and iraResponse are required to register review");
+    sendValidationError(res, "Validation failed", [
+      ...(!userQuery ? [{ field: "userQuery", message: "userQuery is required" }] : []),
+      ...(!iraResponse ? [{ field: "iraResponse", message: "iraResponse is required" }] : [])
+    ]);
     return;
   }
 
@@ -1190,8 +1243,22 @@ apiRouter.post("/api/v1/ira/feedback", authMiddleware(), (req: Request, res: Res
   state.reviewLogs.unshift(newLog);
   addAuditLog(`Logged client/planner response critique. Sentiment: ${isPositive ? "POSITIVE" : "CRITICAL FAILURE (" + newLog.failurePattern + ")"}`, "ira-review-service", (req as any).user.email, isPositive ? "SUCCESS" : "FAILED");
 
-  sendResponse(res, 201, true, "Feedback evaluations saved inside memory schema", {
-    log: newLog
+  const sessionId = newLog.executionId;
+  if (sessionId) {
+    persistHumanFeedbackToDatabase({
+      sessionId,
+      agentName: "FinancialSummaryAgent",
+      feedbackScore: isPositive ? 5 : 1,
+      feedbackComment: newLog.feedbackComment,
+      submittedBy: (req as { user?: { email?: string } }).user?.email
+    });
+  }
+
+  sendResponse(res, 201, true, isDatabaseConfigured()
+    ? "Feedback saved (memory + PostgreSQL when available)"
+    : "Feedback evaluations saved inside memory schema", {
+    log: newLog,
+    persistedToPostgres: Boolean(sessionId && isDatabaseConfigured())
   });
 });
 

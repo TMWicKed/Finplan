@@ -4,6 +4,7 @@
  */
 
 import type { AgentExecutionTrace } from "./types.js";
+import { persistExecutionTraceToDatabase } from "../db/tracePersistence.js";
 
 const traces = new Map<string, AgentExecutionTrace>();
 
@@ -13,6 +14,7 @@ export function storeExecutionTrace(trace: AgentExecutionTrace): void {
     const oldest = traces.keys().next().value;
     if (oldest) traces.delete(oldest);
   }
+  persistExecutionTraceToDatabase(trace);
 }
 
 export function getExecutionTrace(executionId: string): AgentExecutionTrace | undefined {

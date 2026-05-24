@@ -6,6 +6,8 @@
 import { listRecentTraces } from "./executionTraceStore.js";
 import { AgentPerformanceService } from "./AgentPerformanceService.js";
 import { LearningInsightsService } from "./LearningInsightsService.js";
+import { getImprovementRecommendationService } from "./ImprovementRecommendationService.js";
+import { isDatabaseConfigured } from "../db/client.js";
 import type { LearningDashboardPayload } from "./learningTypes.js";
 
 export interface LearningDataSources {
@@ -44,6 +46,10 @@ export class LearningDashboardService {
       sources.systemPromptCorrections
     );
     const governance = this.insightsService.computeGovernance(traces, sources.reviewLogs);
+    const improvementRecommendations = getImprovementRecommendationService().analyze(
+      traces,
+      sources
+    );
 
     return {
       agentPerformance,
@@ -52,8 +58,13 @@ export class LearningDashboardService {
       feedbackTrends,
       learningInsights,
       governance,
+      improvementRecommendations,
       promptCorrectionsActive: sources.systemPromptCorrections.length,
       totalExecutions: traces.length,
+      persistence: {
+        postgresConfigured: isDatabaseConfigured(),
+        fallbackMode: !isDatabaseConfigured()
+      },
       generatedAt: new Date().toISOString()
     };
   }

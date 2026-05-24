@@ -26,6 +26,12 @@ if (!geminiConfigured) {
   console.log("Gemini API key loaded — live LLM responses enabled.");
 }
 
+if (process.env.DATABASE_URL?.trim()) {
+  console.log("DATABASE_URL set — agent traces and feedback will persist to PostgreSQL.");
+} else {
+  console.log("DATABASE_URL not set — using in-memory trace store (demo fallback).");
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
