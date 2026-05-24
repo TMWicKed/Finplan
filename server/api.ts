@@ -5,17 +5,20 @@
 
 import { Router, Request, Response, NextFunction } from "express";
 import crypto from "crypto";
-import { GoogleGenAI, Type } from "@google/genai";
 import {
   User,
   RAHUL_SHARMA_PROFILE,
   RAHUL_SHARMA_GOALS,
   BANK_SAVINGS_DATA,
   INVESTMENT_ALLOCATIONS_SEED,
-  DEMO_WHATIF_SCENARIO,
   FinancialGoal,
   AuditLog
 } from "../src/types.js";
+import { detectBehavioralTendency } from "./lib/behavioralFinance.js";
+import { runGoalSipSimulation } from "./lib/goalPlanning.js";
+import { runWhatIfHomePurchaseSimulation } from "./lib/whatIfSimulation.js";
+import { cleanAndRepairJSON, getGeminiClient } from "./lib/geminiSupport.js";
+import { getAgentOrchestrator, getExecutionTrace, getLearningDashboardService } from "./agents/index.js";
 
 const apiRouter = Router();
 
@@ -51,6 +54,16 @@ interface ReviewLog {
   recommendation?: string;
   appliedPromptCorrection?: boolean;
   timestamp: string;
+  executionId?: string;
+  reflectionVerdict?: string;
+  feedbackComment?: string;
+  overallConfidence?: number;
+  agentWorkflowSnapshot?: {
+    executionId: string;
+    overallConfidence: number;
+    reflectionVerdict?: string;
+    issueCodes?: string[];
+  };
 }
 
 interface Playbook {
@@ -460,28 +473,13 @@ apiRouter.post("/api/v1/goals/simulate", authMiddleware(), (req: Request, res: R
     return;
   }
 
-  const PMT = Number(monthlySIP);
-  const annualReturnRate = Number(annualRate) / 100;
-  const r = annualReturnRate / 12;
-  const n = Number(years) * 12;
-
-  // FV = PMT × ((1 + r)^n - 1) / r
-  let fv = 0;
-  if (r > 0) {
-    fv = PMT * ((Math.pow(1 + r, n) - 1) / r) * (1 + r); // calculated on begin rate of month
-  } else {
-    fv = PMT * n;
-  }
-
-  const totalInvestment = PMT * n;
-  const gains = fv - totalInvestment;
-
-  sendResponse(res, 200, true, "SIP goal simulation success", {
-    futureValue: Math.round(fv),
-    totalInvestment: Math.round(totalInvestment),
-    wealthGained: Math.round(gains),
-    formula: "PMT × ((1 + r)^n - 1) / r"
+  const result = runGoalSipSimulation({
+    monthlySIP: Number(monthlySIP),
+    annualRate: Number(annualRate),
+    years: Number(years)
   });
+
+  sendResponse(res, 200, true, "SIP goal simulation success", result);
 });
 
 // --- SAVINGS INTELLIGENCE ROUTER ---
@@ -623,6 +621,7 @@ apiRouter.get("/api/v1/behavioral/alerts", authMiddleware(), (req: Request, res:
 
   sendResponse(res, 200, true, "Retrieve behavioral metrics successful", {
     behavioralAlerts: state.behavioralAlerts,
+    alerts: state.behavioralAlerts,
     behavioralRiskScore,
     totalEmotionalAlerts
   });
@@ -636,6 +635,7 @@ apiRouter.get("/api/v1/token-usage/metrics", authMiddleware(), (req: Request, re
 
   sendResponse(res, 200, true, "Retrieve token telemetry successful", {
     tokenUsageLogs: state.tokenUsageLogs,
+    logs: state.tokenUsageLogs,
     totalCostInr: Number(totalCostInr.toFixed(3)),
     totalOptimizedSavingsInr: Number(totalOptimizedSavingsInr.toFixed(3)),
     efficiencyRatio: totalQueries > 0 ? Number(((totalOptimizedSavingsInr / (totalCostInr + totalOptimizedSavingsInr)) * 100).toFixed(1)) : 0,
@@ -659,43 +659,16 @@ apiRouter.get("/api/v1/investments", authMiddleware(), (req: Request, res: Respo
 apiRouter.post("/api/v1/whatif/simulate", authMiddleware(), (req: Request, res: Response) => {
   const { homePrice, downPayment, tenureYears, interestRate } = req.body;
 
-  const P = Number(homePrice) - Number(downPayment);
-  const annualRate = Number(interestRate) / 100;
-  const r = annualRate / 12;
-  const n = Number(tenureYears) * 12;
-
-  // EMI Formula: EMI = P × r × (1 + r)^n / ((1 + r)^n - 1)
-  let emi = 0;
-  if (r > 0) {
-    emi = (P * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1);
-  } else {
-    emi = P / n;
-  }
-
-  // Model impact on surplus:
-  // Rent savings offset: say buying home saves ₹18,000 rent. Total fresh committed expense = EMI - rent_savings
-  const rentSavings = 18000;
-  const netSurplusDrop = Math.max(0, Math.round(emi - rentSavings));
-  const newSurplus = Math.max(0, state.profile.investableSurplus - netSurplusDrop);
-
-  // Simulated effect on goals: education funding falls to 41%, retirement falls to 32%
-  const simulatedGoalsImpact = state.goals.map(g => {
-    if (g.type === "education") {
-      return { goalId: g.id, name: g.name, before: g.currentFunding, after: 41 };
-    } else {
-      return { goalId: g.id, name: g.name, before: g.currentFunding, after: 32 };
-    }
+  const simulation = runWhatIfHomePurchaseSimulation(state.profile, state.goals, {
+    homePrice: Number(homePrice),
+    downPayment: Number(downPayment),
+    tenureYears: Number(tenureYears),
+    interestRate: Number(interestRate)
   });
 
   addAuditLog("Run What-If Home Purchase simulation", "whatif-engine-service", (req as any).user.email, "SUCCESS");
 
-  sendResponse(res, 200, true, "What-If simulation calculation successful", {
-    principalLoanAmount: P,
-    calculatedEmi: Math.round(emi),
-    previousSurplus: state.profile.investableSurplus,
-    newSurplus: Math.round(newSurplus),
-    goalsImpact: simulatedGoalsImpact
-  });
+  sendResponse(res, 200, true, "What-If simulation calculation successful", simulation);
 });
 
 // --- AUDIT ROUTER ---
@@ -704,213 +677,6 @@ apiRouter.get("/api/v1/audit/logs", authMiddleware(["PLANNER"]), (req: Request, 
     logs: state.auditLogs
   });
 });
-
-// --- ADVANCED BEHAVIORAL DETECTION (Addition 1) ---
-function detectBehavioralTendency(message: string): { classification: "panic_selling" | "concentration_risk" | "fomo_chasing" | "rational"; nudge: string; score: number } {
-  const msgLower = message.toLowerCase();
-  
-  if (msgLower.includes("crash") || msgLower.includes("fall") || (msgLower.includes("stop") && msgLower.includes("sip")) || msgLower.includes("sell everything") || msgLower.includes("panic")) {
-    return {
-      classification: "panic_selling",
-      nudge: "Panic Trigger: Pausing SIPs during a 15% market drawdown locks in losses. Continuing SIPs leverages rupee-cost average mechanisms buy-in, boosting long term CAGR by 4.2%.",
-      score: 85
-    };
-  }
-  
-  if (msgLower.includes("everything in gold") || msgLower.includes("all my money in gold") || msgLower.includes("gold only") || msgLower.includes("everything in crypto") || msgLower.includes("put all in")) {
-    return {
-      classification: "concentration_risk",
-      nudge: "Concentration Hazard: Single asset classes carry massive systemic volatility. Restricting allocation to maximum 10-15% protects compound growth runways.",
-      score: 72
-    };
-  }
-
-  if (msgLower.includes("next big") || msgLower.includes("crypto multiplier") || msgLower.includes("get rich") || msgLower.includes("penny stock") || msgLower.includes("leveraged")) {
-    return {
-      classification: "fomo_chasing",
-      nudge: "FOMO Risk: chasing speculative, unhedged assets without robust risk profiling often precipitates 40%+ portfolio drawdowns. Maintain stable asset index paths.",
-      score: 64
-    };
-  }
-
-  return {
-    classification: "rational",
-    nudge: "Balanced Behavior: Reasoning is backed by quantitative targets and standard asset rebalancing frameworks.",
-    score: 10
-  };
-}
-
-// --- SECURE SECURITY FILTER: NO SENSITIVE DATA TO CLIENT (Addition 3) ---
-function maskSensitiveFields(text: string): { maskedText: string; totalMasks: number; typesMasked: string[] } {
-  let totalMasks = 0;
-  const typesMasked: string[] = [];
-  
-  // PAN Mask: 5 letters, 4 digits, 1 letter
-  const panRegex = /[A-Z]{5}[0-9]{4}[A-Z]/g;
-  let masked = text.replace(panRegex, (match) => {
-    totalMasks++;
-    if (!typesMasked.includes("PAN_CARD")) typesMasked.push("PAN_CARD");
-    return `${match.slice(0, 3)}XXXXX${match.slice(8)}`;
-  });
-  
-  // Aadhaar Mask: 12 digits
-  const aadhaarRegex = /\b\d{4}[ -]?\d{4}[ -]?\d{4}\b/g;
-  masked = masked.replace(aadhaarRegex, (match) => {
-    totalMasks++;
-    if (!typesMasked.includes("AADHAAR")) typesMasked.push("AADHAAR");
-    return "XXXX-XXXX-XXXX";
-  });
-
-  // Bank Account Numbers: 10 to 16 digits
-  const accountRegex = /\b\d{10,16}\b/g;
-  masked = masked.replace(accountRegex, (match) => {
-    totalMasks++;
-    if (!typesMasked.includes("ACCOUNT_NUMBER")) typesMasked.push("ACCOUNT_NUMBER");
-    return `XXXXXX${match.slice(-4)}`;
-  });
-
-  return { maskedText: masked, totalMasks, typesMasked };
-}
-
-function repairTruncatedJSON(text: string): string {
-  text = text.trim();
-  let inString = false;
-  let escape = false;
-  let quoteChar = '"';
-  const stack: string[] = [];
-
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (char === '\\') {
-      escape = true;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      if (!inString) {
-        inString = true;
-        quoteChar = char;
-      } else if (char === quoteChar) {
-        inString = false;
-      }
-      continue;
-    }
-    if (!inString) {
-      if (char === '{') {
-        stack.push('}');
-      } else if (char === '[') {
-        stack.push(']');
-      } else if (char === '}') {
-        if (stack.length > 0 && stack[stack.length - 1] === '}') {
-          stack.pop();
-        }
-      } else if (char === ']') {
-        if (stack.length > 0 && stack[stack.length - 1] === ']') {
-          stack.pop();
-        }
-      }
-    }
-  }
-
-  let repaired = text;
-  if (inString) {
-    repaired += quoteChar;
-  }
-  while (stack.length > 0) {
-    const closeChar = stack.pop();
-    repaired += closeChar;
-  }
-  return repaired;
-}
-
-function unescapeJSONString(str: string): string {
-  try {
-    return JSON.parse('"' + str + '"');
-  } catch {
-    return str.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-  }
-}
-
-function cleanAndRepairJSON(text: string): any {
-  text = (text || "").trim();
-  if (!text) return {};
-
-  try {
-    return JSON.parse(text);
-  } catch (err) {
-    try {
-      let repaired = repairTruncatedJSON(text);
-      repaired = repaired.replace(/,\s*([}\]])/g, '$1');
-      repaired = repaired.replace(/,\s*"[^"]*"\s*:\s*([}\]])/g, '$1');
-      repaired = repaired.replace(/{\s*"[^"]*"\s*:\s*([}\]])/g, '{}');
-      return JSON.parse(repaired);
-    } catch (err2) {
-      console.warn("Truncated JSON repair failed, running deep regex field extraction", err2);
-      
-      const intentMatch = text.match(/"intent"\s*:\s*"([^"]*)"/);
-      const confidenceMatch = text.match(/"confidence"\s*:\s*([0-9.]+)/);
-      const summaryMatch = text.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)/);
-      const explanationMatch = text.match(/"explanation"\s*:\s*"((?:[^"\\]|\\.)*)(?:"|$)/);
-      const requiresHumanMatch = text.match(/"requires_human_approval"\s*:\s*(true|false)/);
-      
-      const recommendations: string[] = [];
-      const recsMatch = text.match(/"recommendations"\s*:\s*\[([^\]]*)/);
-      if (recsMatch) {
-        const rawItems = recsMatch[1];
-        const itemMatches = rawItems.match(/"((?:[^"\\]|\\.)*)"/g);
-        if (itemMatches) {
-          for (const item of itemMatches) {
-            try {
-              recommendations.push(JSON.parse(item));
-            } catch {
-              recommendations.push(item.replace(/^"|"$/g, ''));
-            }
-          }
-        }
-      }
-
-      const impactMatch = text.match(/"impact"\s*:\s*{\s*"goal_id"\s*:\s*"([^"]*)",\s*"before"\s*:\s*([0-9.]+),\s*"after"\s*:\s*([0-9.]+)/);
-      let impact = undefined;
-      if (impactMatch) {
-        impact = {
-          goal_id: impactMatch[1],
-          before: parseFloat(impactMatch[2]),
-          after: parseFloat(impactMatch[3])
-        };
-      }
-
-      return {
-        intent: intentMatch ? intentMatch[1] : "general_advice",
-        confidence: confidenceMatch ? parseFloat(confidenceMatch[1]) : 0.95,
-        summary: summaryMatch ? unescapeJSONString(summaryMatch[1]) : "Financial analysis completed successfully.",
-        recommendations: recommendations.length > 0 ? recommendations : ["Review active asset allocations to protect compounding yields."],
-        requires_human_approval: requiresHumanMatch ? requiresHumanMatch[1] === "true" : true,
-        impact,
-        explanation: explanationMatch ? unescapeJSONString(explanationMatch[1]) : "Explanation compiled from historic advisory models."
-      };
-    }
-  }
-}
-
-// --- IRA AI AGENT SERVICE ORCHESTRATION ---
-// Instantiate the official GoogleGenAI SDK lazily as recommended
-let googleAIClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI | null {
-  if (!googleAIClient && process.env.GEMINI_API_KEY) {
-    googleAIClient = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build"
-        }
-      }
-    });
-  }
-  return googleAIClient;
-}
 
 apiRouter.post("/api/v1/ira/chat", authMiddleware(), async (req: Request, res: Response) => {
   const { message, chatHistory, whatIfState } = req.body;
@@ -922,218 +688,65 @@ apiRouter.post("/api/v1/ira/chat", authMiddleware(), async (req: Request, res: R
 
   addAuditLog("Orchestrate Ira Agent Multi-Chain", "ira-agent-service", (req as any).user.email, "SUCCESS");
 
-  // Format contextual prompt with demo user Rahul Sharma
-  const profileContext = `
-CLIENT PROFILE IN THE SYSTEM:
-- Name: ${state.profile.name}
-- Age: ${state.profile.age} (Married, 1 child aged 2)
-- Location: ${state.profile.location}
-- Income: ₹${state.profile.income}/month
-- Expenses: ₹${state.profile.expenses}/month
-- Investable Surplus: ₹${state.profile.investableSurplus}/month
-- Current Savings: ₹${state.profile.currentSavings} stored inside SBI Savings Account (2.70% interest rate)
-- Current Investments: ₹${state.profile.currentInvestments.sipAmount}/month in ${state.profile.currentInvestments.description}
-
-GOAL GPS TRACKING:
-${state.goals.map(g => `- ${g.name} (${g.type}): Needed ₹${g.targetAmount} in ${g.targetYears} years. Funding state: ${g.currentFunding}%`).join("\n")}
-
-WHAT-IF CONTEXT FROM PLANNER SLIDER:
-${whatIfState ? JSON.stringify(whatIfState) : "No active what-if simulation is set by user yet."}
-
-PPF details: 7.1% tax-exempt. Section 80C applies.
-NPS details: Section 80C + 80CCD(1B) (additional 50K tax benefit).
-ELSS details: 3 year minimum lock-in.
-Banks interest: PSU (SBI 2.70%, BOB 2.75%), Private (Kotak 3.5-4.0%), SFB (Equitas 7%, AU SFB 7.25%).
-  `;
-
-  // System instructions as requested
-  const systemPrompt = `
-You are Ira, the premier AI financial planning assistant for "FinPlan GPS".
-Always adhere to the following strictly:
-- Always refer to the client's specific numbers (such as income, surplus, EMI) — never give generic copy-pasted rules.
-- Speak in plain, reassuring, jargon-free language. If you mention a technical financial term (e.g., LTCG, PPF lock-in, SFBs), explain its mechanics immediately.
-- Never make final binding financial decisions autonomously — always say "I recommend this route" or "consider this strategy".
-- Thoroughly explain the mathematical reasoning behind each recommendation.
-- When modeling life events (e.g. buying the ₹80L flat with ₹15L down payment, ₹57k/month EMI), highlight that the surplus will tumble from ₹55K to ₹21K. Discuss how this affects the Higher education goal funding (dropping 70% to 41%) and suggest a re-balancing plan (increasing high-return ELSS/mutual funds or using Small Finance Bank rates to build down payments faster).
-- Propose a specific, highly mathematical "Rebalancing plan" if the client surplus falls short.
-- If unsure or missing details, say so clearly — do not make up imaginary interest rates or statistics.
-- Flag any custom recommendation that requires the human planner's final review.
-
-You MUST respond strictly in a valid JSON format matching this schema:
-{
-  "intent": "goal_gap_analysis" | "savings_comparison" | "what_if_rebalancing" | "general_advice",
-  "confidence": 0.0 to 1.0,
-  "summary": "plain language summary analyzing their input and calculations",
-  "recommendations": ["Core actionable item 1", "Core actionable item 2", ...],
-  "impact": { "goal_id": "goal_daughter_edu", "before": 70, "after": 41 },
-  "requires_human_approval": true/false (true if proposing critical investment switches or SGB/NPS asset allocations),
-  "explanation": "rich step-by-step description with financial formula calculations"
-}
-`;
-
-  // 1. Detect Behavioral Risk & Emotional Intent
-  const behavioralTendency = detectBehavioralTendency(message);
-  if (behavioralTendency.classification !== "rational") {
-    state.behavioralAlerts.unshift({
-      id: `behavioral_${crypto.randomBytes(3).toString("hex")}`,
-      clientName: state.profile.name,
-      classification: behavioralTendency.classification,
-      message,
-      timestamp: new Date().toISOString(),
-      nudge: behavioralTendency.nudge,
-      score: behavioralTendency.score
-    });
-    addAuditLog(`Flagged high-risk behavior [${behavioralTendency.classification}] for ${state.profile.name}`, "behavioral-intelligence-service", "System", "SUCCESS");
-  }
-
-  // 2. Format query with injected active playbooks and system prompt corrections
-  const activePlaybooksInjected = state.activePlaybooks
-    .filter(p => p.status === "active")
-    .map(p => `[PLAYBOOK INJECTED: ${p.title}]\n${p.rules.map(r => `  - ${r}`).join("\n")}`)
-    .join("\n\n");
-
-  const correctionsInjected = state.systemPromptCorrections
-    .map((c, i) => `  Correction ${i + 1}: ${c}`)
-    .join("\n");
-
-  const formattedPrompt = `
-SYSTEM INSTRUCTIONS:
-${systemPrompt}
-
-${activePlaybooksInjected ? `### WEALTH MANAGEMENT ADVISORY PLAYBOOKS (ACTIVE):\n${activePlaybooksInjected}\n` : ""}
-${correctionsInjected ? `### CRITICAL LEARNING FEEDBACK CONSTRAINTS (ENFORCED):\n${correctionsInjected}\n` : ""}
-
----
-CONTEXT:
-${profileContext}
-
----
-CHAT HISTORY RECORD:
-${JSON.stringify(chatHistory || [])}
-
----
-CLIENT PROMPT:
-"${message}"
-`;
-
   try {
-    const ai = getGeminiClient();
+    const orchestration = await getAgentOrchestrator().execute({
+      userEmail: (req as any).user.email,
+      message,
+      chatHistory: chatHistory || [],
+      whatIfState: whatIfState ?? null,
+      profile: state.profile,
+      goals: state.goals,
+      playbooks: state.activePlaybooks,
+      systemPromptCorrections: state.systemPromptCorrections
+    });
 
-    if (!ai) {
-      // Graceful fallback for offline demo representation so preview NEVER hangs!
-      let fallbackSummary = "I have simulated the impact of your financial situation.";
-      let fallbackRecs = ["Switch current ₹5L holding to AU SFB or Equitas to extract 7.25% interest.", "Increase Equity SIP from ₹3,000 to ₹12,000/month after adjusting standard expenses."];
-      let fallbackExplanation = "Our calculations show that by maintaining savings at SBI (2.70%), you lose interest gain. High-yield Small Finance banks let you secure ~7.25%, elevating ₹5L to ₹7.09L in 5 years instead of ₹5.71L.";
-      let intent: any = "general_advice";
+    const behavioralAgent = orchestration.agentResults.find(
+      (r) => r.agentName === "BehavioralFinanceAgent"
+    );
+    const tendencyMeta = behavioralAgent?.metadata?.tendency as
+      | ReturnType<typeof detectBehavioralTendency>
+      | undefined;
+    const behavioralTendency = tendencyMeta ?? detectBehavioralTendency(message);
 
-      if (message.toLowerCase().includes("house") || message.toLowerCase().includes("home") || message.toLowerCase().includes("purchas") || message.toLowerCase().includes("flat")) {
-        intent = "what_if_rebalancing";
-        fallbackSummary = "Buying the ₹80L home drastically reduces your monthly investable surplus from ₹55,000 to ₹21,000 due to the ₹56,730 home loan EMI.";
-        fallbackRecs = [
-          "Increase Daughter's education SIP rate using ELSS tax savings to plug the gap.",
-          "Restructure 80C tax deductions via Section 24B up to ₹2 Lakhs limit on home interest.",
-          "Allocate 10% of current savings toward Sovereign Gold Bonds for stable 2.5% RBI coupon gains."
-        ];
-        fallbackExplanation = "The EMI of ₹56,730 consumes the bulk of your surplus. By utilizing Section 24B (Rs 2L tax write-off on home loan interest) and saving on rent, we must aggressively rebalance. We can switch your underutilized Bank Saving (Rs 5L) to AU Small Finance Bank (7.25%) to gain ₹1.38 Lakhs additional interest to build bullet payments.";
-      }
-
-      // Check and apply PII Masking on Fallback
-      const maskSum = maskSensitiveFields(fallbackSummary);
-      const maskExp = maskSensitiveFields(fallbackExplanation);
-      const maskRecs = fallbackRecs.map(r => maskSensitiveFields(r).maskedText);
-      
-      if (maskSum.totalMasks > 0 || maskExp.totalMasks > 0) {
-        addAuditLog("Masked private PII metrics inside offline response payload", "security-masking-service", "System", "SUCCESS");
-      }
-
-      // Record simulated cost
-      const tokensIn = Math.round(formattedPrompt.length / 4);
-      const tokensOut = Math.round((fallbackSummary.length + fallbackExplanation.length) / 4);
-      const costInr = Number(((tokensIn * 0.0062 + tokensOut * 0.0249) / 1000).toFixed(3));
-      const compressionApplied = formattedPrompt.length > 2500;
-      const optimizedSavingsInr = compressionApplied ? Number((costInr * 0.34).toFixed(3)) : 0.0;
-
-      state.tokenUsageLogs.push({
-        id: `tok_${crypto.randomBytes(3).toString("hex")}`,
-        queryType: intent,
-        tokensIn,
-        tokensOut,
-        costInr,
+    if (behavioralTendency.classification !== "rational") {
+      state.behavioralAlerts.unshift({
+        id: `behavioral_${crypto.randomBytes(3).toString("hex")}`,
+        clientName: state.profile.name,
+        classification: behavioralTendency.classification,
+        message,
         timestamp: new Date().toISOString(),
-        compressionApplied,
-        optimizedSavingsInr
+        nudge: behavioralTendency.nudge,
+        score: behavioralTendency.score
       });
+      addAuditLog(
+        `Flagged high-risk behavior [${behavioralTendency.classification}] for ${state.profile.name}`,
+        "behavioral-intelligence-service",
+        "System",
+        "SUCCESS"
+      );
+    }
 
-      setTimeout(() => {
-        sendResponse(res, 200, true, "Ira AI Co-pilot fallback analysis success (Offline-Mode / Key missing)", {
-          intent,
-          confidence: 0.95,
-          summary: maskSum.maskedText,
-          recommendations: maskRecs,
-          impact: { goal_id: "goal_daughter_edu", before: 70, after: 41 },
-          requires_human_approval: true,
-          explanation: maskExp.maskedText,
-          aiProvider: "Simulated Model Engine",
-          behavioralClassification: behavioralTendency.classification,
-          behavioralNudge: behavioralTendency.nudge
-        });
-      }, 800);
+    const summaryAgent = orchestration.agentResults.find(
+      (r) => r.agentName === "FinancialSummaryAgent"
+    );
+    const tokensIn = Number(summaryAgent?.metadata?.tokensIn ?? 0);
+    const tokensOut = Number(summaryAgent?.metadata?.tokensOut ?? 0);
+    const compressionApplied = Boolean(summaryAgent?.metadata?.compressionApplied);
+    const iraPayload = orchestration.iraResponse;
+
+    if (!iraPayload) {
+      sendResponse(res, 500, false, "Ira Agent failed to produce advisory payload", {}, [
+        "FinancialSummaryAgent did not return iraResponse"
+      ]);
       return;
     }
 
-    // Call actual Gemini model for brilliant live response
-    const chatResponse = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: formattedPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          required: ["intent", "confidence", "summary", "recommendations", "requires_human_approval", "explanation"],
-          properties: {
-            intent: { type: Type.STRING },
-            confidence: { type: Type.NUMBER },
-            summary: { type: Type.STRING },
-            recommendations: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            impact: {
-              type: Type.OBJECT,
-              properties: {
-                goal_id: { type: Type.STRING },
-                before: { type: Type.NUMBER },
-                after: { type: Type.NUMBER }
-              }
-            },
-            requires_human_approval: { type: Type.BOOLEAN },
-            explanation: { type: Type.STRING }
-          }
-        }
-      }
-    });
-
-    const parsedResponse = cleanAndRepairJSON(chatResponse.text || "{}");
-
-    // Apply strict PII security compliance filters
-    const maskSum = maskSensitiveFields(parsedResponse.summary || "");
-    const maskExp = maskSensitiveFields(parsedResponse.explanation || "");
-    const maskRecs = (parsedResponse.recommendations || []).map((r: string) => maskSensitiveFields(r).maskedText);
-
-    if (maskSum.totalMasks > 0 || maskExp.totalMasks > 0) {
-      addAuditLog(`Security Shield masked confidential client data (${[...maskSum.typesMasked, ...maskExp.typesMasked].join(", ")})`, "security-masking-service", "System Shield", "SUCCESS");
-    }
-
-    // Capture Token Telemetry metrics
-    const tokensIn = Math.round(formattedPrompt.length / 4);
-    const tokensOut = Math.round(((parsedResponse.summary || "").length + (parsedResponse.explanation || "").length) / 4);
     const costInr = Number(((tokensIn * 0.0062 + tokensOut * 0.0249) / 1000).toFixed(3));
-    const compressionApplied = formattedPrompt.length > 2500;
-    const optimizedSavingsInr = compressionApplied ? Number((costInr * 0.34).toFixed(3)) : 0.0;
+    const optimizedSavingsInr = compressionApplied ? Number((costInr * 0.34).toFixed(3)) : 0;
 
     state.tokenUsageLogs.push({
       id: `tok_${crypto.randomBytes(3).toString("hex")}`,
-      queryType: parsedResponse.intent || "general_advice",
+      queryType: iraPayload.intent || "general_advice",
       tokensIn,
       tokensOut,
       costInr,
@@ -1142,23 +755,70 @@ CLIENT PROMPT:
       optimizedSavingsInr
     });
 
-    sendResponse(res, 200, true, "Ira AI Co-pilot analysis completed", {
-      intent: parsedResponse.intent,
-      confidence: parsedResponse.confidence,
-      summary: maskSum.maskedText,
-      recommendations: maskRecs,
-      impact: parsedResponse.impact,
-      requires_human_approval: parsedResponse.requires_human_approval,
-      explanation: maskExp.maskedText,
-      aiProvider: "Gemini 2.0 / 3.5 Flash",
-      behavioralClassification: behavioralTendency.classification,
-      behavioralNudge: behavioralTendency.nudge
-    });
+    const requiresHuman =
+      iraPayload.requires_human_approval ||
+      orchestration.confidenceEvaluation.requiresHumanReview ||
+      Boolean(orchestration.reflectionEvaluation?.requiresHumanReview);
 
+    sendResponse(res, 200, true, "Ira AI Co-pilot analysis completed", {
+      intent: iraPayload.intent,
+      confidence: iraPayload.confidence,
+      summary: iraPayload.summary,
+      recommendations: iraPayload.recommendations,
+      impact: iraPayload.impact,
+      requires_human_approval: requiresHuman,
+      explanation: iraPayload.explanation,
+      aiProvider: iraPayload.aiProvider,
+      behavioralClassification: iraPayload.behavioralClassification,
+      behavioralNudge: iraPayload.behavioralNudge,
+      agentWorkflow: {
+        executionId: orchestration.executionId,
+        timeline: orchestration.timeline,
+        agentResults: orchestration.agentResults,
+        overallConfidence: orchestration.overallConfidence,
+        finalSummary: orchestration.finalSummary,
+        confidenceEvaluation: orchestration.confidenceEvaluation,
+        reflectionEvaluation: orchestration.reflectionEvaluation
+      }
+    });
   } catch (error: any) {
     console.error("Ira Core AI agent error: ", error);
     sendResponse(res, 500, false, "Ira Agent failed to orchestrate call", {}, [error.message]);
   }
+});
+
+apiRouter.post("/api/v1/ira/agent-workflow", authMiddleware(), async (req: Request, res: Response) => {
+  const { message, chatHistory, whatIfState } = req.body;
+  if (!message) {
+    sendResponse(res, 400, false, "Prompt message is required", {}, ["Missing message"]);
+    return;
+  }
+
+  try {
+    const orchestration = await getAgentOrchestrator().execute({
+      userEmail: (req as any).user.email,
+      message,
+      chatHistory: chatHistory || [],
+      whatIfState: whatIfState ?? null,
+      profile: state.profile,
+      goals: state.goals,
+      playbooks: state.activePlaybooks,
+      systemPromptCorrections: state.systemPromptCorrections
+    });
+
+    sendResponse(res, 200, true, "Agent workflow executed successfully", orchestration);
+  } catch (error: any) {
+    sendResponse(res, 500, false, "Agent workflow execution failed", {}, [error.message]);
+  }
+});
+
+apiRouter.get("/api/v1/ira/agent-traces/:executionId", authMiddleware(), (req: Request, res: Response) => {
+  const trace = getExecutionTrace(req.params.executionId);
+  if (!trace) {
+    sendResponse(res, 404, false, "Execution trace not found");
+    return;
+  }
+  sendResponse(res, 200, true, "Agent execution trace retrieved", { trace });
 });
 
 // --- FINANCIAL NEWS AND AUTOMATED SUGGESTIONS ENDPOINTS ---
@@ -1267,11 +927,11 @@ apiRouter.post("/api/v1/news/analyze", authMiddleware(["PLANNER"]), async (req: 
       });
       
       const parsed = cleanAndRepairJSON(response.text || "{}");
-      headline = parsed.headline || `Leverage ${article.category} Opportunity`;
-      recommendation = parsed.recommendation || `Advise ${targetClient} to review active deposit allocations.`;
-      rationale = parsed.rationale || `Recent changes in ${article.title} could impact compounding values.`;
+      headline = String(parsed.headline || `Leverage ${article.category} Opportunity`);
+      recommendation = String(parsed.recommendation || `Advise ${targetClient} to review active deposit allocations.`);
+      rationale = String(parsed.rationale || `Recent changes in ${article.title} could impact compounding values.`);
       sentimentTrend = parsed.sentimentTrend === "downward" ? "downward" : "upward";
-      urgency = parsed.urgency || computeUrgencyByTrend(article.category, sentimentTrend);
+      urgency = (parsed.urgency as typeof urgency) || computeUrgencyByTrend(article.category, sentimentTrend);
     } catch (err: any) {
       console.warn("Gemini dynamic news parsing failed, utilizing expert fallback", err);
     }
@@ -1452,22 +1112,56 @@ apiRouter.get("/api/v1/ira/review/logs", authMiddleware(), (req: Request, res: R
 });
 
 apiRouter.post("/api/v1/ira/feedback", authMiddleware(), (req: Request, res: Response) => {
-  const { messageId, userQuery, iraResponse, isPositive } = req.body;
-  
+  const {
+    messageId,
+    userQuery,
+    iraResponse,
+    isPositive,
+    executionId,
+    reflectionVerdict,
+    feedbackComment,
+    overallConfidence,
+    agentWorkflow
+  } = req.body;
+
   if (!userQuery || !iraResponse) {
     sendResponse(res, 400, false, "userQuery and iraResponse are required to register review");
     return;
   }
 
   const logId = `rev_${crypto.randomBytes(3).toString("hex")}`;
-  const newLog: any = {
+  const issueCodes = Array.isArray(agentWorkflow?.reflectionEvaluation?.issues)
+    ? agentWorkflow.reflectionEvaluation.issues.map((i: { code: string }) => i.code)
+    : undefined;
+
+  const newLog: ReviewLog = {
     id: logId,
     messageId: messageId || `msg_${Date.now()}`,
     userQuery,
     iraResponse,
     isPositive,
     appliedPromptCorrection: false,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    executionId: executionId || agentWorkflow?.executionId,
+    reflectionVerdict:
+      reflectionVerdict || agentWorkflow?.reflectionEvaluation?.reflectionVerdict,
+    feedbackComment: typeof feedbackComment === "string" ? feedbackComment.trim() : undefined,
+    overallConfidence:
+      typeof overallConfidence === "number"
+        ? overallConfidence
+        : agentWorkflow?.overallConfidence,
+    agentWorkflowSnapshot: executionId || agentWorkflow?.executionId
+      ? {
+          executionId: executionId || agentWorkflow.executionId,
+          overallConfidence:
+            typeof overallConfidence === "number"
+              ? overallConfidence
+              : Number(agentWorkflow?.overallConfidence ?? 0),
+          reflectionVerdict:
+            reflectionVerdict || agentWorkflow?.reflectionEvaluation?.reflectionVerdict,
+          issueCodes
+        }
+      : undefined
   };
 
   if (!isPositive) {
@@ -1498,6 +1192,32 @@ apiRouter.post("/api/v1/ira/feedback", authMiddleware(), (req: Request, res: Res
 
   sendResponse(res, 201, true, "Feedback evaluations saved inside memory schema", {
     log: newLog
+  });
+});
+
+apiRouter.get("/api/v1/ira/learning/dashboard", authMiddleware(), (req: Request, res: Response) => {
+  const dashboard = getLearningDashboardService().buildDashboard({
+    reviewLogs: state.reviewLogs,
+    behavioralAlerts: state.behavioralAlerts,
+    playbooks: state.activePlaybooks,
+    systemPromptCorrections: state.systemPromptCorrections
+  });
+  sendResponse(res, 200, true, "Agent learning dashboard retrieved", dashboard);
+});
+
+apiRouter.get("/api/v1/ira/learning/governance", authMiddleware(), (req: Request, res: Response) => {
+  const dashboard = getLearningDashboardService().buildDashboard({
+    reviewLogs: state.reviewLogs,
+    behavioralAlerts: state.behavioralAlerts,
+    playbooks: state.activePlaybooks,
+    systemPromptCorrections: state.systemPromptCorrections
+  });
+  sendResponse(res, 200, true, "AI governance summary retrieved", {
+    governance: dashboard.governance,
+    reflectionStatistics: dashboard.reflectionStatistics,
+    humanReviewStatistics: dashboard.humanReviewStatistics,
+    promptCorrectionsActive: dashboard.promptCorrectionsActive,
+    generatedAt: dashboard.generatedAt
   });
 });
 

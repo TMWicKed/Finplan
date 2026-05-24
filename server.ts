@@ -9,8 +9,22 @@ import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 import { apiRouter } from "./server/api.js";
 
-// Load Environment variables
-dotenv.config();
+// Load Environment variables from project root (explicit path — tsx cwd can vary)
+const envPath = path.resolve(process.cwd(), ".env");
+const envResult = dotenv.config({ path: envPath });
+
+if (envResult.error && !process.env.GEMINI_API_KEY) {
+  console.warn(`Could not load .env from ${envPath}: ${envResult.error.message}`);
+} else if (envResult.parsed) {
+  console.log(`Loaded ${Object.keys(envResult.parsed).length} variable(s) from .env`);
+}
+
+const geminiConfigured = Boolean(process.env.GEMINI_API_KEY?.trim());
+if (!geminiConfigured) {
+  console.warn("GEMINI_API_KEY is not set — Ira will use offline simulated advisory responses.");
+} else {
+  console.log("Gemini API key loaded — live LLM responses enabled.");
+}
 
 async function startServer() {
   const app = express();

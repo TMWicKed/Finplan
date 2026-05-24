@@ -172,6 +172,7 @@ export default function App() {
             <IraAgentChat
               initialPrompt={iraPrompt}
               authToken={currentUser.token || ""}
+              whatIfState={whatIfState}
             />
           )}
         </div>

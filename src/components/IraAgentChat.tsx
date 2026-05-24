@@ -31,11 +31,13 @@ import {
   ChevronRight,
   TrendingDown
 } from "lucide-react";
+import AgentLearningPanel, { type LearningDashboardData } from "./AgentLearningPanel.js";
 
 interface Message {
   id: string;
   sender: "user" | "ira";
   text: string;
+  executionId?: string;
   structuredPayload?: {
     intent: string;
     confidence: number;
@@ -49,12 +51,86 @@ interface Message {
   };
 }
 
+interface AgentWorkflowResult {
+  agentName: string;
+  status: string;
+  confidence: number;
+  summary: string;
+  recommendations: string[];
+  nextAction: string;
+  executionTime: number;
+  metadata?: Record<string, unknown>;
+}
+
+interface ReflectionIssue {
+  code: string;
+  severity: "critical" | "warning" | "info";
+  message: string;
+  evidence?: string;
+  affectedAgents?: string[];
+}
+
+interface ReflectionEvaluationPayload {
+  reflectionVerdict: "PASS" | "PASS_WITH_WARNINGS" | "FAIL";
+  adjustedConfidence: number;
+  baselineConfidence: number;
+  confidenceAdjustment: number;
+  issues: ReflectionIssue[];
+  recommendations: string[];
+  requiresHumanReview: boolean;
+  reasoning: string[];
+}
+
+interface AgentWorkflowPayload {
+  executionId: string;
+  timeline: {
+    timeLabel: string;
+    agentName: string;
+    event: string;
+    status?: string;
+    confidence?: number;
+    executionTimeMs?: number;
+  }[];
+  agentResults: AgentWorkflowResult[];
+  overallConfidence: number;
+  finalSummary: string;
+  confidenceEvaluation?: {
+    confidence: number;
+    requiresHumanReview: boolean;
+    weakAgents: string[];
+    notes: string[];
+  };
+  reflectionEvaluation?: ReflectionEvaluationPayload;
+}
+
 interface IraAgentChatProps {
   initialPrompt?: string;
   authToken: string;
+  whatIfState?: Record<string, unknown> | null;
 }
 
-export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgentChatProps) {
+const AGENT_DISPLAY: Record<string, { title: string; desc: string }> = {
+  GoalPlanningAgent: { title: "Goal Planning Agent", desc: "Analyzing goals, SIP needs, and funding gaps..." },
+  WhatIfSimulationAgent: { title: "What-If Agent", desc: "Running home-loan EMI and surplus impact simulation..." },
+  BehavioralFinanceAgent: { title: "Behavior Agent", desc: "Detecting panic, FOMO, and concentration bias..." },
+  PlaybookGenerationAgent: { title: "Playbook Agent", desc: "Selecting active advisory playbooks..." },
+  FinancialSummaryAgent: { title: "Summary Agent", desc: "Synthesizing Ira response via Gemini..." },
+  ReflectionAndEvaluationAgent: { title: "Reflection Agent", desc: "Evaluating advisory quality, conflicts, and compliance..." }
+};
+
+const PIPELINE_ORDER = [
+  "GoalPlanningAgent",
+  "WhatIfSimulationAgent",
+  "BehavioralFinanceAgent",
+  "PlaybookGenerationAgent",
+  "FinancialSummaryAgent",
+  "ReflectionAndEvaluationAgent"
+];
+
+/** In-flight UI stops here until the server responds — Summary (Gemini) is the real bottleneck. */
+const SUMMARY_AGENT_INDEX = PIPELINE_ORDER.indexOf("FinancialSummaryAgent");
+
+export default function IraAgentChat({ initialPrompt = "", authToken, whatIfState = null }: IraAgentChatProps) {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: "welcome",
@@ -78,13 +154,13 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
 
   const [inputMsg, setInputMsg] = useState("");
   const [isOrchestrating, setIsOrchestrating] = useState(false);
-  
-  // Pipeline Step Tracking for "Build the Future with Agentic AI" theme
-  const [activeStep, setActiveStep] = useState<number>(0);
+  const [orchestrationElapsedSec, setOrchestrationElapsedSec] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // New Strategy Side-Panel Tab System
-  const [activeSideTab, setActiveSideTab] = useState<"reviewer" | "playbook">("reviewer");
+  const [activeSideTab, setActiveSideTab] = useState<"workflow" | "reviewer" | "playbook" | "learning">("workflow");
+  const [agentWorkflow, setAgentWorkflow] = useState<AgentWorkflowPayload | null>(null);
+  const [runningAgentIndex, setRunningAgentIndex] = useState<number>(-1);
   const [showRightPanel, setShowRightPanel] = useState(true);
 
   // Self-Improving Reviewer lab state variables
@@ -100,6 +176,11 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
   // local checklist tracker for rating disablement
   const [feedbackMap, setFeedbackMap] = useState<Record<string, { rating: "up" | "down", pattern?: string }>>({});
   const [submittingFeedback, setSubmittingFeedback] = useState<string | null>(null);
+  const [feedbackComment, setFeedbackComment] = useState("");
+  const [pendingCritiqueMsgId, setPendingCritiqueMsgId] = useState<string | null>(null);
+  const [messageWorkflowById, setMessageWorkflowById] = useState<Record<string, AgentWorkflowPayload>>({});
+  const [learningDashboard, setLearningDashboard] = useState<LearningDashboardData | null>(null);
+  const [learningLoading, setLearningLoading] = useState(false);
 
   // Tactical Playbooks UI states
   const [playbooks, setPlaybooks] = useState<any[]>([]);
@@ -139,19 +220,48 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
     }
   };
 
+  const loadLearningDashboard = async () => {
+    setLearningLoading(true);
+    try {
+      const res = await fetch("/api/v1/ira/learning/dashboard", {
+        headers: { Authorization: `Bearer ${authToken}` }
+      });
+      const data = await res.json();
+      if (data.success) {
+        setLearningDashboard(data.data as LearningDashboardData);
+      }
+    } catch (err) {
+      console.error("Error loading learning dashboard:", err);
+    } finally {
+      setLearningLoading(false);
+    }
+  };
+
   useEffect(() => {
     loadReviewerData();
     loadPlaybooks();
+    loadLearningDashboard();
   }, [authToken]);
 
+  useEffect(() => {
+    if (activeSideTab === "learning") {
+      loadLearningDashboard();
+    }
+  }, [activeSideTab]);
+
   // Handle Response feedback rating submission
-  const submitFeedback = async (msgId: string, isPositive: boolean) => {
+  const submitFeedback = async (msgId: string, isPositive: boolean, comment?: string) => {
     const targetMsg = messages.find(m => m.id === msgId);
     if (!targetMsg) return;
 
     const msgIndex = messages.findIndex(m => m.id === msgId);
     const prevMsg = msgIndex > 0 ? messages[msgIndex - 1] : null;
     const userQuery = prevMsg ? prevMsg.text : "Initial Welcome Context query";
+    const workflowForMsg =
+      messageWorkflowById[msgId] ??
+      (targetMsg.executionId && agentWorkflow?.executionId === targetMsg.executionId
+        ? agentWorkflow
+        : null);
 
     setSubmittingFeedback(msgId);
     try {
@@ -165,12 +275,18 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
           messageId: msgId,
           userQuery,
           iraResponse: targetMsg.text,
-          isPositive
+          isPositive,
+          executionId: targetMsg.executionId ?? workflowForMsg?.executionId,
+          reflectionVerdict: workflowForMsg?.reflectionEvaluation?.reflectionVerdict,
+          overallConfidence: workflowForMsg?.overallConfidence,
+          feedbackComment: comment?.trim() || undefined,
+          agentWorkflow: workflowForMsg ?? undefined
         })
       });
       const data = await res.json();
       if (data.success) {
         await loadReviewerData();
+        await loadLearningDashboard();
         setFeedbackMap(prev => ({
           ...prev,
           [msgId]: {
@@ -178,6 +294,8 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
             pattern: data.data.log?.failurePattern
           }
         }));
+        setPendingCritiqueMsgId(null);
+        setFeedbackComment("");
       }
     } catch (err) {
       console.error("Error submitting rating feed:", err);
@@ -277,14 +395,48 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
     }
   };
 
-  const pipelineSteps = [
-    { title: "Intent Agent", desc: "Analyzing linguistic query structure..." },
-    { title: "Data Agent", desc: "Correlating active client metrics & databases..." },
-    { title: "Planning Agent", desc: "Simulating interest calculators and EMI algorithms..." },
-    { title: "Advisory Agent", desc: "Aligning Section 80C / 24B / 80CCD tax guidelines..." },
-    { title: "Validation Agent", desc: "Auditing compliance and human planner limits..." },
-    { title: "Summary Agent", desc: "Formulating conversational JSON response payload..." }
-  ];
+  const getReflectionVerdictStyle = (verdict?: string) => {
+    switch (verdict) {
+      case "PASS":
+        return "bg-emerald-50 text-emerald-800 border-emerald-200";
+      case "PASS_WITH_WARNINGS":
+        return "bg-amber-50 text-amber-800 border-amber-200";
+      case "FAIL":
+        return "bg-red-50 text-red-800 border-red-200";
+      default:
+        return "bg-slate-50 text-slate-600 border-slate-200";
+    }
+  };
+
+  const getIssueSeverityStyle = (severity: string) => {
+    switch (severity) {
+      case "critical":
+        return "bg-red-100 text-red-800";
+      case "warning":
+        return "bg-amber-100 text-amber-800";
+      default:
+        return "bg-slate-100 text-slate-700";
+    }
+  };
+
+  const getAgentUiStatus = (agentName: string): "pending" | "running" | "completed" | "failed" | "skipped" => {
+    const result = agentWorkflow?.agentResults.find((r) => r.agentName === agentName);
+    if (result) {
+      if (result.status === "failed") return "failed";
+      if (result.status === "skipped") return "skipped";
+      if (result.status === "completed") return "completed";
+    }
+    const orderIndex = PIPELINE_ORDER.indexOf(agentName);
+    if (isOrchestrating && runningAgentIndex >= orderIndex && !result) {
+      if (runningAgentIndex === orderIndex) return "running";
+      if (runningAgentIndex > orderIndex && orderIndex < SUMMARY_AGENT_INDEX) return "completed";
+      return "pending";
+    }
+    if (isOrchestrating && runningAgentIndex > orderIndex && orderIndex < SUMMARY_AGENT_INDEX) {
+      return "completed";
+    }
+    return result ? "completed" : "pending";
+  };
 
   useEffect(() => {
     if (initialPrompt) {
@@ -293,8 +445,20 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
   }, [initialPrompt]);
 
   useEffect(() => {
+    if (!isOrchestrating) {
+      setOrchestrationElapsedSec(0);
+      return;
+    }
+    const t0 = Date.now();
+    const tick = window.setInterval(() => {
+      setOrchestrationElapsedSec(Math.floor((Date.now() - t0) / 1000));
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [isOrchestrating]);
+
+  useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isOrchestrating, activeStep]);
+  }, [messages, isOrchestrating, agentWorkflow]);
 
   const handleQuerySubmit = async (e?: React.FormEvent, customQuery?: string) => {
     if (e) e.preventDefault();
@@ -310,18 +474,17 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
     setMessages((prev) => [...prev, userBubble]);
     setInputMsg("");
     setIsOrchestrating(true);
-    setActiveStep(0);
+    setAgentWorkflow(null);
+    setRunningAgentIndex(0);
+    setActiveSideTab("workflow");
 
-    // 2. Simulate agent execution steps (1.2s intervals to let user witness the multi-agent chain orchestration)
-    const stepIntervals = [1200, 2400, 3600, 4800, 6000, 7200];
-    stepIntervals.forEach((time, index) => {
-      setTimeout(() => {
-        setActiveStep(index + 1);
-      }, time);
-    });
+    const progressTimer = window.setInterval(() => {
+      setRunningAgentIndex((prev) =>
+        prev < SUMMARY_AGENT_INDEX ? prev + 1 : prev
+      );
+    }, 900);
 
     try {
-      // Create request payload
       const response = await fetch("/api/v1/ira/chat", {
         method: "POST",
         headers: {
@@ -330,61 +493,69 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
         },
         body: JSON.stringify({
           message: query,
-          chatHistory: messages.map(m => ({ sender: m.sender, text: m.text }))
+          chatHistory: messages.map((m) => ({ sender: m.sender, text: m.text })),
+          whatIfState: whatIfState ?? undefined
         })
       });
 
       const resData = await response.json();
+      window.clearInterval(progressTimer);
+      setRunningAgentIndex(PIPELINE_ORDER.length);
 
-      // Delay rendering final AI response until pipeline steps complete
-      setTimeout(() => {
-        if (resData.success) {
-          const iraBubble: Message = {
-            id: `ira_${Date.now()}`,
-            sender: "ira",
-            text: resData.data.summary,
-            structuredPayload: {
-              intent: resData.data.intent || "general_advice",
-              confidence: resData.data.confidence || 0.9,
-              summary: resData.data.summary,
-              recommendations: resData.data.recommendations || [],
-              requires_human_approval: resData.data.requires_human_approval || false,
-              explanation: resData.data.explanation || "",
-              aiProvider: resData.data.aiProvider || "Gemini Flash Model",
-              behavioralClassification: resData.data.behavioralClassification,
-              behavioralNudge: resData.data.behavioralNudge
-            }
-          };
-          setMessages((prev) => [...prev, iraBubble]);
-        } else {
-          // Fallback UI bubble if server response is generic or failed
-          throw new Error(resData.message || "Engine API Error");
+      if (resData.success) {
+        if (resData.data.agentWorkflow) {
+          setAgentWorkflow(resData.data.agentWorkflow as AgentWorkflowPayload);
         }
-        setIsOrchestrating(false);
-      }, 8200);
 
-    } catch (err: any) {
-      setTimeout(() => {
-        const errorBubble: Message = {
-          id: `err_${Date.now()}`,
+        const workflowPayload = resData.data.agentWorkflow as AgentWorkflowPayload | undefined;
+        const iraMsgId = `ira_${Date.now()}`;
+        if (workflowPayload) {
+          setMessageWorkflowById((prev) => ({ ...prev, [iraMsgId]: workflowPayload }));
+        }
+
+        const iraBubble: Message = {
+          id: iraMsgId,
           sender: "ira",
-          text: `I apologize, my neural financial orchestrator encountered an execution timeout. Let me provide a core advice fallback:`,
+          executionId: workflowPayload?.executionId,
+          text: resData.data.summary,
           structuredPayload: {
-            intent: "general_advice",
-            confidence: 0.8,
-            summary: "Core advisory backup system activated.",
-            recommendations: [
-              "Review the India Section 80C ELSS mutual funds allocations with up to ₹1.5L lock-in limit.",
-              "Look into switching ₹5L savings to small finance banks (7.25% AU SFB) immediately to secure ₹1.38L higher returns."
-            ],
-            requires_human_approval: true,
-            explanation: "Backup systems utilize local matrix calculations.",
-            aiProvider: "Internal Edge Calculations"
+            intent: resData.data.intent || "general_advice",
+            confidence: resData.data.confidence || 0.9,
+            summary: resData.data.summary,
+            recommendations: resData.data.recommendations || [],
+            requires_human_approval: resData.data.requires_human_approval || false,
+            explanation: resData.data.explanation || "",
+            aiProvider: resData.data.aiProvider || "Gemini Flash Model",
+            behavioralClassification: resData.data.behavioralClassification,
+            behavioralNudge: resData.data.behavioralNudge
           }
         };
-        setMessages((prev) => [...prev, errorBubble]);
-        setIsOrchestrating(false);
-      }, 8200);
+        setMessages((prev) => [...prev, iraBubble]);
+      } else {
+        throw new Error(resData.message || "Engine API Error");
+      }
+    } catch {
+      window.clearInterval(progressTimer);
+      const errorBubble: Message = {
+        id: `err_${Date.now()}`,
+        sender: "ira",
+        text: `I apologize, my agent orchestrator encountered an error. Here is a core advisory fallback:`,
+        structuredPayload: {
+          intent: "general_advice",
+          confidence: 0.8,
+          summary: "Core advisory backup system activated.",
+          recommendations: [
+            "Review the India Section 80C ELSS mutual funds allocations with up to ₹1.5L lock-in limit.",
+            "Look into switching ₹5L savings to small finance banks (7.25% AU SFB) immediately to secure ₹1.38L higher returns."
+          ],
+          requires_human_approval: true,
+          explanation: "Backup systems utilize local matrix calculations.",
+          aiProvider: "Internal Edge Calculations"
+        }
+      };
+      setMessages((prev) => [...prev, errorBubble]);
+    } finally {
+      setIsOrchestrating(false);
     }
   };
 
@@ -425,7 +596,7 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
         <div className="flex items-center space-x-3.5">
           <div className="flex items-center space-x-2 bg-emerald-50 text-emerald-800 border border-emerald-150 rounded-lg p-1.5 px-3">
             <Workflow className="w-4 h-4 text-emerald-600" />
-            <span className="text-xs font-bold hidden sm:inline">6-Agent Orchestration Layer</span>
+            <span className="text-xs font-bold hidden sm:inline">5-Agent Orchestration Layer</span>
           </div>
           
           <button
@@ -543,35 +714,63 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
 
                     {/* Highly interactive rating critique loop section */}
                     {isIra && (
-                      <div className="flex items-center space-x-3 pt-1 text-xs">
-                        <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">Evaluation Audit:</span>
-                        {feedbackMap[msg.id] ? (
-                          <div className="flex items-center space-x-2">
-                            {feedbackMap[msg.id].rating === "up" ? (
-                              <span className="flex items-center text-emerald-700 bg-emerald-50 font-bold px-2.5 py-1 rounded-lg border border-emerald-100 text-[10px]">
-                                <ThumbsUp className="w-3 h-3 mr-1 text-[#2cab52] fill-emerald-100" /> Compliant & Accurate
-                              </span>
-                            ) : (
-                              <span className="flex items-center text-rose-700 bg-rose-50 font-extrabold px-2.5 py-1 rounded-lg border border-rose-150 text-[10px]">
-                                <ThumbsDown className="w-3 h-3 mr-1 text-[#e11d48]" /> Critiqued ({feedbackMap[msg.id].pattern})
-                              </span>
-                            )}
-                          </div>
-                        ) : (
-                          <div className="flex items-center space-x-2">
+                      <div className="space-y-2 pt-1">
+                        {msg.executionId && (
+                          <p className="text-[9px] text-slate-400 font-mono truncate">
+                            Linked execution: {msg.executionId}
+                          </p>
+                        )}
+                        <div className="flex items-center space-x-3 text-xs flex-wrap gap-2">
+                          <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">Evaluation Audit:</span>
+                          {feedbackMap[msg.id] ? (
+                            <div className="flex items-center space-x-2">
+                              {feedbackMap[msg.id].rating === "up" ? (
+                                <span className="flex items-center text-emerald-700 bg-emerald-50 font-bold px-2.5 py-1 rounded-lg border border-emerald-100 text-[10px]">
+                                  <ThumbsUp className="w-3 h-3 mr-1 text-[#2cab52] fill-emerald-100" /> Compliant & Accurate
+                                </span>
+                              ) : (
+                                <span className="flex items-center text-rose-700 bg-rose-50 font-extrabold px-2.5 py-1 rounded-lg border border-rose-150 text-[10px]">
+                                  <ThumbsDown className="w-3 h-3 mr-1 text-[#e11d48]" /> Critiqued ({feedbackMap[msg.id].pattern})
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <div className="flex items-center space-x-2">
+                              <button
+                                onClick={() => submitFeedback(msg.id, true)}
+                                disabled={submittingFeedback !== null}
+                                className="p-1 px-2 rounded-lg border border-gray-150 hover:bg-slate-50 hover:border-[#2cab52] hover:text-[#2cab52] transition flex items-center text-slate-500 text-[10px] font-bold cursor-pointer bg-white"
+                              >
+                                <ThumbsUp className="w-3 h-3 mr-1" /> Perfect
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setPendingCritiqueMsgId(pendingCritiqueMsgId === msg.id ? null : msg.id);
+                                }}
+                                disabled={submittingFeedback !== null}
+                                className="p-1 px-2 rounded-lg border border-gray-150 hover:bg-slate-50 hover:border-red-500 hover:text-red-600 transition flex items-center text-slate-500 text-[10px] font-bold cursor-pointer bg-white"
+                              >
+                                <ThumbsDown className="w-3 h-3 mr-1" /> Critique
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        {pendingCritiqueMsgId === msg.id && !feedbackMap[msg.id] && (
+                          <div className="flex gap-2 items-end">
+                            <input
+                              type="text"
+                              value={feedbackComment}
+                              onChange={(e) => setFeedbackComment(e.target.value)}
+                              placeholder="Optional feedback comment for learning loop..."
+                              className="flex-1 text-[10px] px-2 py-1.5 border border-gray-200 rounded-lg"
+                            />
                             <button
-                              onClick={() => submitFeedback(msg.id, true)}
+                              type="button"
+                              onClick={() => submitFeedback(msg.id, false, feedbackComment)}
                               disabled={submittingFeedback !== null}
-                              className="p-1 px-2 rounded-lg border border-gray-150 hover:bg-slate-50 hover:border-[#2cab52] hover:text-[#2cab52] transition flex items-center text-slate-500 text-[10px] font-bold cursor-pointer bg-white"
+                              className="text-[10px] font-bold px-2 py-1.5 bg-red-50 text-red-700 border border-red-100 rounded-lg cursor-pointer"
                             >
-                              <ThumbsUp className="w-3 h-3 mr-1" /> Perfect
-                            </button>
-                            <button
-                              onClick={() => submitFeedback(msg.id, false)}
-                              disabled={submittingFeedback !== null}
-                              className="p-1 px-2 rounded-lg border border-gray-150 hover:bg-slate-50 hover:border-red-500 hover:text-red-600 transition flex items-center text-slate-500 text-[10px] font-bold cursor-pointer bg-white"
-                            >
-                              <ThumbsDown className="w-3 h-3 mr-1" /> Critique
+                              Submit
                             </button>
                           </div>
                         )}
@@ -595,34 +794,54 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
                       <Workflow className="w-4 h-4 text-[#2cab52] animate-pulse" />
                       <span>Agentic Multi-Agent Chain Active</span>
                     </span>
-                    <span className="text-[10px] text-gray-400">Triggering 6 Independent Services...</span>
+                    <span className="text-[10px] text-gray-400">
+                      {runningAgentIndex >= SUMMARY_AGENT_INDEX
+                        ? `Summary Agent calling Gemini… ${orchestrationElapsedSec}s (Reflection runs after)`
+                        : "AgentOrchestrator running…"}
+                    </span>
                   </div>
 
                   <div className="space-y-2.5">
-                    {pipelineSteps.map((step, idx) => {
-                      const isComplete = activeStep > idx;
-                      const isCurrent = activeStep === idx;
+                    {PIPELINE_ORDER.map((agentName, idx) => {
+                      const ui = AGENT_DISPLAY[agentName];
+                      const status = getAgentUiStatus(agentName);
+                      const result = agentWorkflow?.agentResults.find((r) => r.agentName === agentName);
                       return (
-                        <div key={idx} className="flex items-center justify-between text-[11px] leading-tight">
-                          <div className="flex items-center space-x-2.5">
-                            <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold font-mono text-[9px] ${
-                              isComplete ? "bg-[#2cab52] text-[#071a2b]" :
-                              isCurrent ? "bg-[#071a2b] text-[#2cab52] animate-pulse border border-[#2cab52]" :
+                        <div key={agentName} className="flex items-center justify-between text-[11px] leading-tight">
+                          <div className="flex items-center space-x-2.5 min-w-0">
+                            <div className={`w-4 h-4 rounded-full flex items-center justify-center font-bold font-mono text-[9px] shrink-0 ${
+                              status === "completed" ? "bg-[#2cab52] text-[#071a2b]" :
+                              status === "running" ? "bg-[#071a2b] text-[#2cab52] animate-pulse border border-[#2cab52]" :
+                              status === "failed" ? "bg-red-500 text-white" :
+                              status === "skipped" ? "bg-amber-400 text-slate-900" :
                               "bg-gray-100 text-gray-400"
                             }`}>
-                              {isComplete ? "✓" : idx + 1}
+                              {status === "completed" ? "✓" : status === "failed" ? "!" : idx + 1}
                             </div>
-                            <span className={`font-bold ${isComplete ? "text-[#2cab52]" : isCurrent ? "text-slate-800" : "text-gray-400"}`}>
-                              {step.title}
+                            <span className={`font-bold truncate ${status === "completed" ? "text-[#2cab52]" : status === "running" ? "text-slate-800" : "text-gray-400"}`}>
+                              {ui?.title ?? agentName}
                             </span>
-                            <span className="text-gray-400 hidden sm:inline">- {step.desc}</span>
+                            <span className="text-gray-400 hidden sm:inline truncate">- {ui?.desc}</span>
                           </div>
 
-                          {isCurrent && (
-                            <span className="text-[10px] text-[#2cab52] font-semibold animate-pulse font-mono uppercase">PROCESSING...</span>
+                          {status === "running" && (
+                            <span className="text-[10px] text-[#2cab52] font-semibold animate-pulse font-mono uppercase shrink-0">
+                              {agentName === "FinancialSummaryAgent" && runningAgentIndex >= SUMMARY_AGENT_INDEX
+                                ? "GEMINI"
+                                : "RUNNING"}
+                            </span>
                           )}
-                          {isComplete && (
-                            <span className="text-[10px] text-emerald-500 font-bold font-mono uppercase">SUCCESS</span>
+                          {isOrchestrating &&
+                            agentName === "ReflectionAndEvaluationAgent" &&
+                            runningAgentIndex >= SUMMARY_AGENT_INDEX &&
+                            !result && (
+                            <span className="text-[10px] text-slate-400 font-mono uppercase shrink-0">QUEUED</span>
+                          )}
+                          {status === "completed" && result && (
+                            <span className="text-[10px] text-emerald-500 font-bold font-mono uppercase shrink-0">{result.confidence}%</span>
+                          )}
+                          {status === "skipped" && (
+                            <span className="text-[10px] text-amber-500 font-bold font-mono uppercase shrink-0">SKIPPED</span>
                           )}
                         </div>
                       );
@@ -670,7 +889,13 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
               required
               disabled={isOrchestrating}
               onChange={(e) => setInputMsg(e.target.value)}
-              placeholder={isOrchestrating ? "Waiting for Summary Agent to build response JSON..." : "Ask Ira about savings, what-if rebalancing, or investments..."}
+              placeholder={
+                isOrchestrating
+                  ? runningAgentIndex >= SUMMARY_AGENT_INDEX
+                    ? `Summary Agent calling Gemini (${orchestrationElapsedSec}s) — Reflection runs on server after…`
+                    : "Running deterministic agents on server…"
+                  : "Ask Ira about savings, what-if rebalancing, or investments..."
+              }
               className="flex-1 px-4 py-3 bg-white border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#2cab52]/40 disabled:bg-gray-100 disabled:text-gray-400"
             />
             <button
@@ -691,6 +916,16 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
             <div className="flex border-b border-gray-200 bg-white items-center justify-between px-4 shrink-0 h-14">
               <div className="flex space-x-4">
                 <button
+                  onClick={() => setActiveSideTab("workflow")}
+                  className={`py-4 text-xs font-extrabold tracking-wider uppercase border-b-2 transition cursor-pointer ${
+                    activeSideTab === "workflow"
+                      ? "border-[#2cab52] text-slate-900"
+                      : "border-transparent text-slate-400 hover:text-slate-600"
+                  }`}
+                >
+                  ⚡ Agent Workflow
+                </button>
+                <button
                   onClick={() => setActiveSideTab("reviewer")}
                   className={`py-4 text-xs font-extrabold tracking-wider uppercase border-b-2 transition cursor-pointer ${
                     activeSideTab === "reviewer"
@@ -710,6 +945,16 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
                 >
                   🎯 Playbook Center
                 </button>
+                <button
+                  onClick={() => setActiveSideTab("learning")}
+                  className={`py-4 text-xs font-extrabold tracking-wider uppercase border-b-2 transition cursor-pointer ${
+                    activeSideTab === "learning"
+                      ? "border-[#2cab52] text-slate-900"
+                      : "border-transparent text-slate-400 hover:text-slate-600"
+                  }`}
+                >
+                  📈 Learning
+                </button>
               </div>
 
               <div className="text-[10px] bg-[#2cab52]/10 text-emerald-800 px-2 py-1 rounded font-extrabold flex items-center">
@@ -718,7 +963,201 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
             </div>
 
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
-              {activeSideTab === "reviewer" ? (
+              {activeSideTab === "workflow" ? (
+                <>
+                  <div className="bg-white rounded-xl p-4 border border-gray-150 shadow-sm space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-900">
+                        {agentWorkflow?.reflectionEvaluation ? "Adjusted Confidence" : "Pipeline Confidence"}
+                      </span>
+                      <span className={`text-lg font-extrabold font-mono ${
+                        (agentWorkflow?.overallConfidence ?? 0) >= 75 ? "text-emerald-600" : "text-amber-600"
+                      }`}>
+                        {agentWorkflow?.overallConfidence ?? "—"}%
+                      </span>
+                    </div>
+                    {agentWorkflow?.reflectionEvaluation && (
+                      <p className="text-[9px] text-slate-500 font-mono">
+                        Baseline {agentWorkflow.reflectionEvaluation.baselineConfidence}% → adjusted{" "}
+                        {agentWorkflow.reflectionEvaluation.adjustedConfidence}% (
+                        {agentWorkflow.reflectionEvaluation.confidenceAdjustment} pts)
+                      </p>
+                    )}
+                    {(agentWorkflow?.confidenceEvaluation?.requiresHumanReview ||
+                      agentWorkflow?.reflectionEvaluation?.requiresHumanReview) && (
+                      <p className="text-[10px] text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-2 py-1.5 font-semibold flex items-center gap-1">
+                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                        Human planner review required
+                      </p>
+                    )}
+                    {agentWorkflow?.executionId && (
+                      <p className="text-[9px] text-slate-400 font-mono truncate">ID: {agentWorkflow.executionId}</p>
+                    )}
+                  </div>
+
+                  {agentWorkflow?.reflectionEvaluation && (
+                    <div className="bg-slate-900 rounded-xl border border-slate-700 shadow-lg overflow-hidden">
+                      <div className="px-4 py-3 border-b border-slate-700 flex items-center justify-between bg-slate-950">
+                        <div className="flex items-center gap-2">
+                          <ShieldCheck className="w-4 h-4 text-[#2cab52]" />
+                          <span className="text-[10px] font-extrabold text-slate-100 uppercase tracking-wider">
+                            Reflection Audit Card
+                          </span>
+                        </div>
+                        <span className={`text-[9px] font-black uppercase px-2.5 py-1 rounded border ${getReflectionVerdictStyle(agentWorkflow.reflectionEvaluation.reflectionVerdict)}`}>
+                          {agentWorkflow.reflectionEvaluation.reflectionVerdict.replace(/_/g, " ")}
+                        </span>
+                      </div>
+
+                      <div className="p-4 space-y-3">
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="bg-slate-800/60 rounded-lg p-2.5 border border-slate-700">
+                            <span className="text-[8px] text-slate-400 uppercase font-bold block">Adjusted Confidence</span>
+                            <span className="text-sm font-extrabold font-mono text-[#2cab52]">
+                              {agentWorkflow.reflectionEvaluation.adjustedConfidence}%
+                            </span>
+                          </div>
+                          <div className="bg-slate-800/60 rounded-lg p-2.5 border border-slate-700">
+                            <span className="text-[8px] text-slate-400 uppercase font-bold block">Review Status</span>
+                            <span className={`text-[10px] font-bold ${agentWorkflow.reflectionEvaluation.requiresHumanReview ? "text-amber-400" : "text-emerald-400"}`}>
+                              {agentWorkflow.reflectionEvaluation.requiresHumanReview ? "HITL Required" : "Auto-Approved"}
+                            </span>
+                          </div>
+                        </div>
+
+                        {agentWorkflow.reflectionEvaluation.issues.length > 0 && (
+                          <div className="space-y-1.5">
+                            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">
+                              Issues Found ({agentWorkflow.reflectionEvaluation.issues.length})
+                            </span>
+                            {agentWorkflow.reflectionEvaluation.issues.map((issue, idx) => (
+                              <div key={idx} className="bg-slate-800/40 rounded-lg p-2 border border-slate-700/80">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <span className={`text-[8px] font-black uppercase px-1.5 py-0.5 rounded ${getIssueSeverityStyle(issue.severity)}`}>
+                                    {issue.severity}
+                                  </span>
+                                  <span className="text-[9px] font-mono text-slate-300">{issue.code}</span>
+                                </div>
+                                <p className="text-[10px] text-slate-300 leading-snug">{issue.message}</p>
+                                {issue.evidence && (
+                                  <p className="text-[9px] text-slate-500 mt-1 font-mono">{issue.evidence}</p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {agentWorkflow.reflectionEvaluation.recommendations.length > 0 && (
+                          <div className="space-y-1">
+                            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Recommendations</span>
+                            <ul className="space-y-1">
+                              {agentWorkflow.reflectionEvaluation.recommendations.map((rec, idx) => (
+                                <li key={idx} className="text-[10px] text-slate-300 flex gap-1.5 leading-snug">
+                                  <ChevronRight className="w-3 h-3 text-[#2cab52] shrink-0 mt-0.5" />
+                                  {rec}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {agentWorkflow.reflectionEvaluation.reasoning.length > 0 && (
+                          <div className="space-y-1">
+                            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider">Reasoning Trace</span>
+                            <div className="max-h-28 overflow-y-auto space-y-0.5 font-mono text-[8px] text-slate-500 bg-slate-950/50 rounded-lg p-2 border border-slate-800">
+                              {agentWorkflow.reflectionEvaluation.reasoning.map((line, idx) => (
+                                <p key={idx}>{line}</p>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    {PIPELINE_ORDER.map((agentName) => {
+                      const ui = AGENT_DISPLAY[agentName];
+                      const result = agentWorkflow?.agentResults.find((r) => r.agentName === agentName);
+                      const status = result?.status ?? (isOrchestrating ? "pending" : "pending");
+                      const isReflection = agentName === "ReflectionAndEvaluationAgent";
+                      const reflectionMeta = isReflection && result?.metadata
+                        ? (result.metadata as { reflectionVerdict?: string; requiresHumanReview?: boolean; issueCount?: number })
+                        : null;
+                      return (
+                        <div key={agentName} className={`bg-white rounded-xl p-3 border shadow-sm ${
+                          isReflection ? "border-slate-300 ring-1 ring-slate-200" : "border-gray-150"
+                        }`}>
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-bold text-slate-800 flex items-center gap-1">
+                              {isReflection && <ShieldCheck className="w-3 h-3 text-slate-600" />}
+                              {ui?.title ?? agentName}
+                            </span>
+                            <span className={`text-[9px] font-black uppercase px-2 py-0.5 rounded-full ${
+                              status === "completed" ? "bg-emerald-50 text-emerald-700" :
+                              status === "failed" ? "bg-red-50 text-red-700" :
+                              status === "skipped" ? "bg-amber-50 text-amber-700" :
+                              "bg-slate-100 text-slate-500"
+                            }`}>
+                              {status}
+                            </span>
+                          </div>
+                          {result && (
+                            <>
+                              <p className="text-[10px] text-slate-500 leading-snug line-clamp-2">{result.summary}</p>
+                              {isReflection && reflectionMeta && (
+                                <div className="mt-2 flex flex-wrap gap-1">
+                                  {reflectionMeta.reflectionVerdict && (
+                                    <span className={`text-[8px] font-bold uppercase px-1.5 py-0.5 rounded border ${getReflectionVerdictStyle(reflectionMeta.reflectionVerdict)}`}>
+                                      {reflectionMeta.reflectionVerdict.replace(/_/g, " ")}
+                                    </span>
+                                  )}
+                                  {reflectionMeta.requiresHumanReview && (
+                                    <span className="text-[8px] font-bold uppercase px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                                      HITL
+                                    </span>
+                                  )}
+                                  {typeof reflectionMeta.issueCount === "number" && reflectionMeta.issueCount > 0 && (
+                                    <span className="text-[8px] font-bold uppercase px-1.5 py-0.5 rounded bg-red-100 text-red-800">
+                                      {reflectionMeta.issueCount} issue(s)
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                              <div className="flex items-center justify-between mt-2 text-[9px] font-mono text-slate-400">
+                                <span>{isReflection ? "Adjusted" : "Confidence"}: {result.confidence}%</span>
+                                <span>{result.executionTime}ms</span>
+                              </div>
+                            </>
+                          )}
+                          {!result && (
+                            <p className="text-[10px] text-slate-400 italic">Awaiting orchestration run...</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {agentWorkflow?.timeline && agentWorkflow.timeline.length > 0 && (
+                    <div className="bg-slate-900 rounded-xl p-4 border border-slate-950 text-slate-200 space-y-2">
+                      <span className="text-[10px] font-bold text-[#2cab52] uppercase tracking-wider block mb-2">Execution Timeline</span>
+                      <div className="space-y-1 max-h-48 overflow-y-auto font-mono text-[9px]">
+                        {agentWorkflow.timeline.map((entry, i) => (
+                          <div key={i} className="flex gap-2">
+                            <span className="text-slate-500 shrink-0">{entry.timeLabel}</span>
+                            <span className="text-[#2cab52] shrink-0">{entry.agentName.replace("Agent", "")}</span>
+                            <span className={
+                              entry.event === "FAILED" ? "text-red-400" :
+                              entry.event === "COMPLETED" ? "text-emerald-400" :
+                              "text-slate-300"
+                            }>{entry.event}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : activeSideTab === "reviewer" ? (
                 <>
                   {/* Stats dashboard heading */}
                   <div className="grid grid-cols-3 gap-3">
@@ -852,7 +1291,7 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
                     </div>
                   </div>
                 </>
-              ) : (
+              ) : activeSideTab === "playbook" ? (
                 <>
                   {/* Custom playbooks creation portal */}
                   <div className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm space-y-3">
@@ -997,7 +1436,13 @@ export default function IraAgentChat({ initialPrompt = "", authToken }: IraAgent
                     </div>
                   </div>
                 </>
-              )}
+              ) : activeSideTab === "learning" ? (
+                <AgentLearningPanel
+                  data={learningDashboard}
+                  loading={learningLoading}
+                  onRefresh={loadLearningDashboard}
+                />
+              ) : null}
             </div>
           </div>
         )}
